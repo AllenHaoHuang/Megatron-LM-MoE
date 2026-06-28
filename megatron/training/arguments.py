@@ -1086,7 +1086,7 @@ def validate_args(args, defaults={}):
 
     # Checks.
     if args.ffn_hidden_size is None:
-        if args.swiglu or args.pnglu:
+        if args.swiglu or args.pnglu or args.xprglu:
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
             # the same ballpark as the counterpart with 4*h size
@@ -1729,6 +1729,17 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['activation_func'] = F.silu
         # Fused bias+activation kernels hardcode SiLU/GELU and cannot run PolyNorm.
         kw_args['bias_activation_fusion'] = False
+    if args.xprglu:
+        # XPRGLU replaces the gate of a gated linear unit; it is itself a (learnable) gated unit,
+        # so it cannot be combined with the non-gated squared-relu and implies gated linear units.
+        assert not args.squared_relu, '--xprglu is a gated unit and is incompatible with --squared-relu.'
+        assert not args.pnglu, '--xprglu and --pnglu are mutually exclusive GLU gates.'
+        kw_args['gated_linear_unit'] = True
+        # The gate is computed by the XPRGLU module. Keep SiLU as a harmless placeholder
+        # activation_func for the (unused) non-xprglu code paths and width-doubling assumptions.
+        kw_args['activation_func'] = F.silu
+        # Fused bias+activation kernels hardcode SiLU/GELU and cannot run XPRGLU.
+        kw_args['bias_activation_fusion'] = False
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
@@ -2060,6 +2071,8 @@ def _add_network_size_args(parser):
         # defined explicitly as CLI arguments below
         "pnglu",
         "pnglu_fusion",
+        "xprglu",
+        "xprglu_fusion",
         "sandwich_norm",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
@@ -2137,6 +2150,16 @@ def _add_network_size_args(parser):
                        'coefficients.')
     group.add_argument('--no-pnglu-fusion', action='store_false', dest='pnglu_fusion',
                        help='Disable the fused Triton kernel for --pnglu and use the torch '
+                       'implementation instead (e.g. for debugging). The fused path is on by '
+                       'default and auto-falls-back on CPU / TP-sharded layers / missing Triton.')
+    group.add_argument('--xprglu', action='store_true',
+                       help='Replace the SiLU gate of SwiGLU with the learnable XPRGLU gate: '
+                       'gate(x) = |ap2|*x**2 + |ap1|*x + |b| for x>0, '
+                       '(|b|+|an|)*softsign(x) + |b| for x<=0. Implies gated linear units. '
+                       'Each MoE expert gets its own XPRGLU coefficients. Mutually exclusive '
+                       'with --pnglu.')
+    group.add_argument('--no-xprglu-fusion', action='store_false', dest='xprglu_fusion',
+                       help='Disable the fused Triton kernel for --xprglu and use the torch '
                        'implementation instead (e.g. for debugging). The fused path is on by '
                        'default and auto-falls-back on CPU / TP-sharded layers / missing Triton.')
     group.add_argument('--quick-geglu', action='store_true',

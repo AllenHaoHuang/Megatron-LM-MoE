@@ -459,9 +459,9 @@ def num_floating_point_operations(args, batch_size):
         fma_expansion_factor = 2
         # - 3x (gated linear unit): h->2*ffn_h GEMM and ffn_h->h GEMM are stacked.
         # - 2x (non-gated): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
-        # pnglu (PolyNorm GLU) is also a GLU (fc1 is h->2*ffn_h), so it counts as gated even
-        # though it does not set args.swiglu.
-        ffn_expansion_factor = 3 if (args.swiglu or args.pnglu) else 2
+        # pnglu (PolyNorm GLU) and xprglu are also GLUs (fc1 is h->2*ffn_h), so they count as gated
+        # even though they do not set args.swiglu.
+        ffn_expansion_factor = 3 if (args.swiglu or args.pnglu or args.xprglu) else 2
 
         if args.multi_latent_attention:
             assert not args.group_query_attention
@@ -704,7 +704,7 @@ def num_floating_point_operations(args, batch_size):
             gqa_groups=args.num_query_groups,
             kv_channels=args.kv_channels,
             mlp_expansion=args.ffn_hidden_size / args.hidden_size,
-            swiglu=args.swiglu or args.pnglu,  # pnglu is a GLU (gated) but does not set args.swiglu
+            swiglu=args.swiglu or args.pnglu or args.xprglu,  # pnglu/xprglu are GLUs but do not set args.swiglu
             moe_latent_size=args.moe_latent_size,
             moe_ffn_hidden_size=(args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None
                                  else args.ffn_hidden_size),

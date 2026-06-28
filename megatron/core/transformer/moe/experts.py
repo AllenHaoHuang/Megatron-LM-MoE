@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from megatron.core import tensor_parallel
-from megatron.core.activations import PolyNorm, squared_relu
+from megatron.core.activations import PolyNorm, XPRGLU, squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -249,6 +249,14 @@ class TEGroupedMLP(MegatronModule):
                 tp_group=self.tp_group,
             )
 
+        # XPRGLU GLU: one coefficient set per local expert, expanded per-token via tokens_per_expert.
+        if self.config.xprglu:
+            self.xprglu_glu = XPRGLU(
+                num_local_experts=self.num_local_experts,
+                config=self.config,
+                tp_group=self.tp_group,
+            )
+
         self.linear_fc2 = submodules.linear_fc2(
             self.num_local_experts,
             not_none(self.config.moe_ffn_hidden_size),
@@ -374,6 +382,17 @@ class TEGroupedMLP(MegatronModule):
                     x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
                 )
                 probs_fused = True
+            elif self.config.gated_linear_unit and self.config.xprglu:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = self.xprglu_glu(
+                    x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
+                )
+                probs_fused = True
             elif self.config.gated_linear_unit:
 
                 def glu(x):
@@ -494,8 +513,8 @@ class TEGroupedMLP(MegatronModule):
         sharded_state_dict = {}
         for name, module in self._modules.items():
             module_sharded_offsets = sharded_offsets
-            if name == 'polynorm_glu' and not singleton_local_shards:
-                # The PolyNorm coefficients are stored as a single (num_local_experts,)
+            if name in ('polynorm_glu', 'xprglu_glu') and not singleton_local_shards:
+                # The PolyNorm / XPRGLU coefficients are stored as a single (num_local_experts,)
                 # tensor. Prepend an expert-parallel sharding axis so this rank's coefficients
                 # occupy the [ep_rank * num_local_experts : ...] slice of the global tensor,
                 # mirroring how the expert weights are mapped to global experts. Without this,
@@ -1038,7 +1057,14 @@ class OffloadingExpertsMLP(MegatronModule):
                 config=self.config,
                 tp_group=self.tp_group,
             )
-        
+
+        if self.config.xprglu:
+            self.xprglu_glu = XPRGLU(
+                num_local_experts=self.num_local_experts,
+                config=self.config,
+                tp_group=self.tp_group,
+            )
+
         # For now all expert weights are offloaded in CPU.
         # NOTE: when FP8 is enabled, we allocate experts as a single tensor
         # to make sure we can access main_grad as a single tensor in the backward
@@ -1393,6 +1419,33 @@ class OffloadingExpertsMLP(MegatronModule):
         a2 = torch.repeat_interleave(torch.abs(self.polynorm_glu.alpha_2), tpe_tensor)
         return a1, a2
 
+    def _xprglu_glu_coeffs(self, tokens_per_expert):
+        """Per-token positive XPRGLU coefficients ``(ap1, ap2, an, b)``.
+
+        abs / the ``an = |beta| + |alpha_n|`` coupling / repeat_interleave run outside the offloading
+        autograd Function so the coefficient parameter gradients flow back via standard autograd.
+        """
+        if not self.config.xprglu:
+            return None, None, None, None
+        assert (
+            self.config.activation_func_clamp_value is None
+            and self.config.glu_linear_offset == 0.0
+        ), (
+            "XPRGLU on the FP8 offloading path does not yet support "
+            "activation_func_clamp_value / glu_linear_offset."
+        )
+        device = self.xprglu_glu.beta.device
+        if isinstance(tokens_per_expert, torch.Tensor):
+            tpe_tensor = tokens_per_expert.to(device=device)
+        else:
+            tpe_tensor = torch.tensor(tokens_per_expert, device=device)
+        ap1_e, ap2_e, an_e, b_e = self.xprglu_glu._positive_coeffs()
+        ap1 = torch.repeat_interleave(ap1_e, tpe_tensor)
+        ap2 = torch.repeat_interleave(ap2_e, tpe_tensor)
+        an = torch.repeat_interleave(an_e, tpe_tensor)
+        b = torch.repeat_interleave(b_e, tpe_tensor)
+        return ap1, ap2, an, b
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -1423,8 +1476,9 @@ class OffloadingExpertsMLP(MegatronModule):
                 )
                 tokens_per_expert_padded = torch.tensor(tokens_per_expert_padded, dtype=torch.int32, device='cpu')
 
-                # Per-token PolyNorm coefficients computation
+                # Per-token PolyNorm / XPRGLU coefficients computation
                 a1, a2 = self._polynorm_glu_coeffs(tokens_per_expert_padded)
+                ap1, ap2, an, b = self._xprglu_glu_coeffs(tokens_per_expert_padded)
 
                 output = offloading_fp8_grouped_swiglu_mlp(
                     self.weight1,
@@ -1445,6 +1499,10 @@ class OffloadingExpertsMLP(MegatronModule):
                     self.wgrad_accumulation_and_reduce_hooks,
                     a1,
                     a2,
+                    ap1,
+                    ap2,
+                    an,
+                    b,
                 )
 
                 output = self.quantization_unpadding(output, tokens_per_expert_list)
@@ -1482,8 +1540,9 @@ class OffloadingExpertsMLP(MegatronModule):
                 if self.weight2_list is None:
                     self.weight2_list = list(torch.unbind(self.weight2, dim=0))
 
-                # Empty input: counts sum to 0, so a1/a2 are length-0 (None on the SwiGLU path).
+                # Empty input: counts sum to 0, so coeffs are length-0 (None on the SwiGLU path).
                 a1, a2 = self._polynorm_glu_coeffs(tokens_per_expert)
+                ap1, ap2, an, b = self._xprglu_glu_coeffs(tokens_per_expert)
 
                 output = offloading_fp8_grouped_swiglu_mlp(
                     self.weight1,
@@ -1504,6 +1563,10 @@ class OffloadingExpertsMLP(MegatronModule):
                     self.wgrad_accumulation_and_reduce_hooks,
                     a1,
                     a2,
+                    ap1,
+                    ap2,
+                    an,
+                    b,
                 )
 
                 return output, None

@@ -221,6 +221,31 @@ class TransformerConfig(ModelParallelConfig):
     to the torch implementation automatically regardless of this flag. Set False to force the torch
     path (e.g. for debugging or bitwise comparison)."""
 
+    xprglu: bool = False
+    """If True, replace the gate of the gated linear unit with the learnable XPRGLU gate:
+    ``XPRGLU(x_glu) * x_linear`` where, with positive coefficients ``ap1=|alpha_p1|``,
+    ``ap2=|alpha_p2|``, ``an=|beta|+|alpha_n|`` and ``b=|beta|``::
+
+        XPRGLU(x) = ap2*x**2 + ap1*x + b      if x  > 0
+        XPRGLU(x) = an*softsign(x) + b         if x <= 0
+
+    Requires ``gated_linear_unit=True`` and is mutually exclusive with ``pnglu``. Each (local) expert
+    in an MoE layer gets its own coefficient set. Unlike PolyNorm GLU the gate is purely element-wise
+    over the ffn feature dim (no reduction), so it is exact at any TP/ETP degree (only the replicated
+    coefficient gradients are all-reduced across the relevant tensor-parallel group). Not compatible
+    with ``bias_activation_fusion``, ``use_te_activation_func``, ``fp8``/``fp4`` (the non-offloading
+    quantized GEMM path), or ``transformer_impl='inference_optimized'`` (these assume the built-in
+    fused SwiGLU/SiLU kernels). The FP8 offloading-experts path is supported."""
+
+    xprglu_fusion: bool = True
+    """If True (default), use the fused Triton kernel for XPRGLU (``xprglu=True``) — it fuses the
+    gate, the ``* x_linear`` and the optional ``* score`` (MoE probs / per-token scale) multiplies
+    into one pass, running close to SwiGLU speed and shape-agnostic over the MoE token count. The
+    fused path is used only on CUDA when the local ffn feature dim is whole on the rank
+    (``tp_size == 1``, e.g. ETP=1 experts); TP/ETP-sharded layers, CPU, or missing Triton fall back
+    to the torch implementation automatically regardless of this flag. Set False to force the torch
+    path (e.g. for debugging or bitwise comparison)."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -1277,6 +1302,42 @@ class TransformerConfig(ModelParallelConfig):
             # all-reduces the feature statistics and the alpha gradients across the relevant
             # tensor-parallel group, so it is correct (and consistent) at any TP/ETP degree. No
             # parallelism restriction is needed.
+
+        # XPRGLU GLU (xprglu): like pnglu, the GLU gate becomes a small learnable module, so the
+        # fused / TE / quantized activation kernels (which hardcode SiLU/GELU) cannot be used.
+        if self.xprglu:
+            if self.pnglu:
+                raise ValueError("xprglu=True and pnglu=True are mutually exclusive GLU gates.")
+            if not self.gated_linear_unit:
+                raise ValueError(
+                    "xprglu=True requires gated_linear_unit=True (it replaces the GLU gate)."
+                )
+            if self.bias_activation_fusion:
+                raise ValueError(
+                    "xprglu=True is incompatible with bias_activation_fusion: the fused SwiGLU/GeGLU "
+                    "kernel hardcodes the activation. Disable bias-activation fusion "
+                    "(e.g. --no-bias-swiglu-fusion)."
+                )
+            if self.use_te_activation_func:
+                raise ValueError("xprglu=True is incompatible with use_te_activation_func.")
+            if self.fp8 is not None or self.fp4 is not None:
+                raise ValueError(
+                    "xprglu=True is not supported with fp8/fp4: the quantized grouped-expert path "
+                    "pads tokens_per_expert and applies fused activation kernels. (The FP8 "
+                    "offloading-experts path is supported separately.)"
+                )
+            if self.use_fused_weighted_squared_relu:
+                raise ValueError("xprglu=True is incompatible with use_fused_weighted_squared_relu.")
+            if self.moe_use_offloading_experts:
+                assert self.moe_use_inplace_fp8_param, "xprglu=True with offloading experts currently only supports fp8 path"
+            if self.transformer_impl == "inference_optimized":
+                raise ValueError(
+                    "xprglu=True is not supported with transformer_impl='inference_optimized' "
+                    "(the FlashInfer / mcore fused MoE kernels hardcode the activation type)."
+                )
+            # NOTE: XPRGLU is element-wise over the ffn feature dimension, so its values are
+            # invariant to TP/ETP sharding; only the replicated coefficient gradients are
+            # all-reduced across the relevant tensor-parallel group. No parallelism restriction.
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")

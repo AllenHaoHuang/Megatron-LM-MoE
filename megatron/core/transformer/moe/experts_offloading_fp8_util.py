@@ -44,6 +44,10 @@ from megatron.core.fusions.fused_polynorm_glu import (
     fused_polynorm_glu_forward,
     fused_polynorm_glu_backward,
 )
+from megatron.core.fusions.fused_xprglu import (
+    fused_xprglu_forward,
+    fused_xprglu_backward,
+)
 
 @dataclass(frozen=True)
 class OffloadingFP8Config:
@@ -62,6 +66,7 @@ class OffloadingFP8Config:
     moe_ffn_hidden_size: int
     gated_linear_unit: bool
     gated_polynorm_linear_unit: bool
+    gated_xprglu_linear_unit: bool = False
     polynorm_eps: float = 1e-6
     fc1_out_size: int = 0
 
@@ -102,6 +107,7 @@ class OffloadingFP8Config:
             moe_ffn_hidden_size=config.moe_ffn_hidden_size,
             gated_linear_unit=config.gated_linear_unit,
             gated_polynorm_linear_unit=config.pnglu,
+            gated_xprglu_linear_unit=config.xprglu,
             polynorm_eps=getattr(config, "polynorm_eps", 1e-6),
             moe_offloading_chunk_size=config.moe_offloading_chunk_size,
             moe_offloading_num_chunks=config.moe_offloading_num_chunks,
@@ -611,6 +617,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         config: OffloadingFP8Config,
         a1: torch.Tensor = None,
         a2: torch.Tensor = None,
+        ap1: torch.Tensor = None,
+        ap2: torch.Tensor = None,
+        an: torch.Tensor = None,
+        b: torch.Tensor = None,
     ):
         # prefetch the first chunk of expert weights to GPU
         curr_buffer_metadata = cls.prefetch_expert_weights(0, cpu_w2, gpu_w2_buffers, stream_manager, fp8_parameter_manager, config)
@@ -623,6 +633,17 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 a1,
                 a2,
                 config.polynorm_eps,
+                permuted_probs.unsqueeze(-1),
+            )
+        elif config.gated_xprglu_linear_unit:
+            # XPRGLU gate + GLU multiply + per-token probs in one fused kernel (inv is None;
+            # XPRGLU caches no reduction state).
+            s, inv = fused_xprglu_forward(
+                fc1_output,
+                ap1,
+                ap2,
+                an,
+                b,
                 permuted_probs.unsqueeze(-1),
             )
         else:
@@ -673,7 +694,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
         
-        return fc2_output, fp8_s, inv if config.gated_polynorm_linear_unit else None
+        return fc2_output, fp8_s, inv if (config.gated_polynorm_linear_unit or config.gated_xprglu_linear_unit) else None
 
 
     @classmethod
@@ -693,11 +714,18 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         a1: torch.Tensor = None,
         a2: torch.Tensor = None,
         inv: torch.Tensor = None,
+        ap1: torch.Tensor = None,
+        ap2: torch.Tensor = None,
+        an: torch.Tensor = None,
+        b: torch.Tensor = None,
     ):
         """
         ds [m, H] = grad_y [m, h] @ w2.T [H, h]
 
         da [m, 2*H] = backward_activation(ds, a, permuted_probs)
+
+        Returns ``(grad_a, grad_probs, grad_a1, grad_a2, grad_ap1, grad_ap2, grad_an, grad_b)``;
+        the coefficient grads not belonging to the active activation are ``None``.
         """
         fp8_grad_y_per_chunk = grad_y[1]
         fp8_grad_y_scales_per_chunk = grad_y[2]
@@ -747,10 +775,15 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             grad_a, grad_a1, grad_a2, grad_probs = fused_polynorm_glu_backward(
                 grad_s, a, a1, a2, inv, config.polynorm_eps, permuted_probs.unsqueeze(-1)
             )
-            return grad_a, grad_probs, grad_a1, grad_a2
+            return grad_a, grad_probs, grad_a1, grad_a2, None, None, None, None
+        elif config.gated_xprglu_linear_unit:
+            grad_a, grad_ap1, grad_ap2, grad_an, grad_b, grad_probs = fused_xprglu_backward(
+                grad_s, a, ap1, ap2, an, b, permuted_probs.unsqueeze(-1)
+            )
+            return grad_a, grad_probs, None, None, grad_ap1, grad_ap2, grad_an, grad_b
         else:
             grad_a, grad_probs = swiglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
-            return grad_a, grad_probs, None, None
+            return grad_a, grad_probs, None, None, None, None, None, None
 
     @classmethod
     def call_backward_grad_x(
@@ -845,6 +878,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         fuse_gradient_accumulation: bool = False,
         a1: torch.Tensor = None,
         a2: torch.Tensor = None,
+        ap1: torch.Tensor = None,
+        ap2: torch.Tensor = None,
+        an: torch.Tensor = None,
+        b: torch.Tensor = None,
     ):
         """
         dw2 [h, H] = grad_y.T [h, m] @ s.T [H, m]
@@ -853,6 +890,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         if config.gated_polynorm_linear_unit:
             s, _ = fused_polynorm_glu_forward(
                 a, a1, a2, config.polynorm_eps, permuted_probs.unsqueeze(-1)
+            )
+        elif config.gated_xprglu_linear_unit:
+            s, _ = fused_xprglu_forward(
+                a, ap1, ap2, an, b, permuted_probs.unsqueeze(-1)
             )
         else:
             s = swiglu_forward(a, permuted_probs.unsqueeze(-1))
@@ -989,10 +1030,16 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         if len(args) < 9:
             raise ValueError(f"Insufficient arguments for forward pass of GroupedSwiMLP. Expected at least 9, got {len(args)}")
 
-        # Leading differentiable inputs: per-token PolyNorm GLU coefficients (None for SwiGLU).
+        # Leading differentiable inputs: per-token activation coefficients (None for SwiGLU).
+        # PolyNorm uses (a1, a2); XPRGLU uses (ap1, ap2, an, b). Trailing args use negative
+        # indexing so they are unaffected by how many leading coefficient tensors are present.
         a1: torch.Tensor = args[0]
         a2: torch.Tensor = args[1]
-        
+        ap1: torch.Tensor = args[2]
+        ap2: torch.Tensor = args[3]
+        an: torch.Tensor = args[4]
+        b: torch.Tensor = args[5]
+
         cpu_w1: torch.nn.Parameter =  args[-16]
         cpu_w2: torch.nn.Parameter =  args[-15]
         cpu_w1_list: list[torch.Tensor] = args[-14]
@@ -1066,11 +1113,19 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             config,
             a1,
             a2,
+            ap1,
+            ap2,
+            an,
+            b,
         )
 
-        # context saving for polynorm GLU
+        # context saving for polynorm GLU / XPRGLU coefficients
         ctx.a1 = a1
         ctx.a2 = a2
+        ctx.ap1 = ap1
+        ctx.ap2 = ap2
+        ctx.an = an
+        ctx.b = b
         ctx.inv = inv
 
         # context saving
@@ -1190,7 +1245,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         fp8_grad_y_full, fp8_grad_y_chunks, fp8_grad_y_sf_chunks = per_token_cast_to_fp8_chunked_fused(
             grad_y, total_token_num_per_chunk, gran_k=128,
         )
-        grad_a, grad_probs, grad_a1, grad_a2 = OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_a(
+        grad_a, grad_probs, grad_a1, grad_a2, grad_ap1, grad_ap2, grad_an, grad_b = OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_a(
             (fp8_grad_y_full, fp8_grad_y_chunks, fp8_grad_y_sf_chunks),
             fc1_output,
             cpu_w2_list,
@@ -1205,6 +1260,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             ctx.a1,
             ctx.a2,
             ctx.inv,
+            ctx.ap1,
+            ctx.ap2,
+            ctx.an,
+            ctx.b,
         )
 
         # backward grad_x computation
@@ -1244,6 +1303,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             config.gradient_accumulation_fusion,
             ctx.a1,
             ctx.a2,
+            ctx.ap1,
+            ctx.ap2,
+            ctx.an,
+            ctx.b,
         )
 
         # backward grad_w1 computation
@@ -1282,8 +1345,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             for hook_fn in ctx.wgrad_accumulation_and_reduce_hooks:
                 hook_fn()
 
-        # Leading grads correspond to the a1/a2 PolyNorm coefficient inputs (None for SwiGLU)
-        return grad_a1, grad_a2, grad_w1_ret, grad_w2_ret, None, None, None, None, None, None, grad_x, None, None, grad_probs, None, None, None, None
+        # Leading grads correspond to the 6 activation coefficient inputs in apply() order:
+        # (a1, a2) for PolyNorm, (ap1, ap2, an, b) for XPRGLU; all None for SwiGLU. The remaining
+        # entries mirror the trailing apply() args (only cpu_w1/cpu_w2 wgrads are attached in
+        # _wgrad_post_process, so grad_w1_ret/grad_w2_ret are None here).
+        return grad_a1, grad_a2, grad_ap1, grad_ap2, grad_an, grad_b, grad_w1_ret, grad_w2_ret, None, None, None, None, None, None, grad_x, None, None, grad_probs, None, None, None, None
 
 
 
@@ -1308,6 +1374,10 @@ def offloading_fp8_grouped_swiglu_mlp(
     wgrad_accumulation_and_reduce_hooks: list,
     a1: torch.Tensor = None,
     a2: torch.Tensor = None,
+    ap1: torch.Tensor = None,
+    ap2: torch.Tensor = None,
+    an: torch.Tensor = None,
+    b: torch.Tensor = None,
 ) -> torch.Tensor:
     """Autograd function for Offloading Experts Grouped SwiGLU MLP.
 
@@ -1330,6 +1400,10 @@ def offloading_fp8_grouped_swiglu_mlp(
     output, _ = OffloadingExpertsFP8GroupedSwiMLP.apply(
         a1,
         a2,
+        ap1,
+        ap2,
+        an,
+        b,
         cpu_w1,
         cpu_w2,
         cpu_w1_list,
