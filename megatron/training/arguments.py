@@ -2059,6 +2059,7 @@ def _add_network_size_args(parser):
         "apply_rope_fusion",
         # defined explicitly as CLI arguments below
         "pnglu",
+        "pnglu_norm",
         "pnglu_fusion",
         "sandwich_norm",
     ]
@@ -2132,9 +2133,16 @@ def _add_network_size_args(parser):
                        help='Use gated linear units and SiLU activation instead of default gelu')
     group.add_argument('--pnglu', action='store_true',
                        help='Replace the SiLU gate of SwiGLU with a learnable 2nd-order '
-                       'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). '
+                       'PolyNorm: gate(x) = |a1|*norm(x) + |a2|*norm(x**2), where norm is set by '
+                       '--pnglu-norm (default rma: x/sqrt(mean|x|)). '
                        'Implies gated linear units. Each MoE expert gets its own PolyNorm '
                        'coefficients.')
+    group.add_argument('--pnglu-norm', type=str, default='rma', choices=['rma', 'rms'],
+                       help='Normalizer inside PolyNorm GLU (--pnglu). "rma" (root-mean-abs, '
+                       'default): norm(t)=t/sqrt(mean|t|), degree-1/2, NOT scale-invariant in the '
+                       'input so the fc1 weight stays anchored by the loss (recommended). "rms" '
+                       '(root-mean-square): norm(t)=t/sqrt(mean t**2), the classic RMSNorm gate '
+                       '(scale-invariant in its input); kept for A/B comparison.')
     group.add_argument('--no-pnglu-fusion', action='store_false', dest='pnglu_fusion',
                        help='Disable the fused Triton kernel for --pnglu and use the torch '
                        'implementation instead (e.g. for debugging). The fused path is on by '
@@ -2620,6 +2628,19 @@ def _add_training_args(parser):
     group.add_argument('--gains-lr', type=float, default=None,
                        help='Absolute LR for the per-axis gains AdamW under md_decoupling. When '
                        'unset, falls back to --lr (and still tracks the schedule shape of --lr).')
+    group.add_argument('--matrix-weight-decay', type=float, default=None,
+                       help='Weight decay for matrix (2D) params under md_decoupling. When unset, '
+                       'falls back to --weight-decay. Set 0.0 to disable decay on the matrices '
+                       'while keeping it on the gains via --gains-weight-decay.')
+    group.add_argument('--gains-weight-decay', type=float, default=None,
+                       help='Weight decay for the per-axis gains (scale terms) under md_decoupling. '
+                       'When unset, falls back to --weight-decay.')
+    group.add_argument('--gains-weight-decay-target', type=str, default='zero',
+                       choices=['zero', 'neutral', 'init'],
+                       help='Where the gains weight decay pulls the gain under md_decoupling. '
+                       '"zero" (default): toward raw gain 0. "neutral": toward effective '
+                       'multiplier 1 (no scaling impact; Qwen-style decay-to-1). "init": toward '
+                       'each gain\'s seeded init value.')
     group.add_argument('--gain-parametrization', type=str, default='direct',
                        choices=['direct', 'softplus'],
                        help='Reparametrize the stored gain g; effective multiplier is phi(g). '

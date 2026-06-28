@@ -23,15 +23,20 @@ pytestmark = pytest.mark.skipif(
 EPS = 1e-6
 
 
-def _ref(x_glu, x_linear, a1, a2, eps=EPS, score=None):
-    """Pure-torch reference: gate(x_glu) * x_linear * [score], fp32 math cast to input dtype."""
+def _ref(x_glu, x_linear, a1, a2, eps=EPS, score=None, use_rma=True):
+    """Pure-torch reference: gate(x_glu) * x_linear * [score], fp32 math cast to input dtype.
+
+    ``use_rma`` selects the normalizer (matches activations.compiled_polynorm):
+    RMA -> t/sqrt(mean|t|); RMS -> t/sqrt(mean t**2).
+    """
 
     def col(a):
         a = a.float()
         return a.reshape(-1, 1) if a.numel() > 1 else a
 
     def norm(t):
-        return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps)
+        stat = t.abs() if use_rma else t * t
+        return t * torch.rsqrt(stat.mean(-1, keepdim=True) + eps)
 
     xf = x_glu.float()
     gate = col(a1) * norm(xf) + col(a2) * norm(xf * xf)
@@ -46,11 +51,12 @@ def _tols(dtype):
 
 
 @pytest.mark.internal
+@pytest.mark.parametrize("use_rma", [True, False], ids=["rma", "rms"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("use_score", [False, True])
 @pytest.mark.parametrize("shape", [(16, 64), (128, 1024), (37, 257)])
-def test_fused_matches_reference(dtype, use_score, shape):
-    """Dense case: fused fwd + grads (dX, dM, dα1/2, dscore) match the torch reference."""
+def test_fused_matches_reference(dtype, use_score, shape, use_rma):
+    """Dense case: fused fwd + grads (dX, dM, dα1/2, dscore) match the torch reference (both norms)."""
     M, D = shape
     torch.manual_seed(0)
     x = torch.randn(M, D, dtype=dtype, device="cuda", requires_grad=True)
@@ -65,8 +71,8 @@ def test_fused_matches_reference(dtype, use_score, shape):
 
     xf, mf, a1f, a2f, scf = clones(x, m, a1, a2, score)
 
-    y_fused = fused_polynorm_glu_impl(x, m, a1, a2, EPS, score)
-    y_ref = _ref(xf, mf, a1f, a2f, score=scf)
+    y_fused = fused_polynorm_glu_impl(x, m, a1, a2, EPS, score, use_rma)
+    y_ref = _ref(xf, mf, a1f, a2f, score=scf, use_rma=use_rma)
 
     tols = _tols(dtype)
     assert y_fused.dtype == y_ref.dtype
@@ -86,7 +92,8 @@ def test_fused_matches_reference(dtype, use_score, shape):
 
 
 @pytest.mark.internal
-def test_fused_backward_finite_difference():
+@pytest.mark.parametrize("use_rma", [True, False], ids=["rma", "rms"])
+def test_fused_backward_finite_difference(use_rma):
     """Independent fp32 finite-difference check of the kernel backward (dX, dM, dα, dscore)."""
     torch.manual_seed(1)
     M, D = 4, 16
@@ -98,14 +105,14 @@ def test_fused_backward_finite_difference():
     # The kernel runs in fp32; compute fp32 analytic grads and compare to fp32-input finite diffs.
     def fwd(x_, m_, a_, s_):
         return fused_polynorm_glu_impl(
-            x_.float(), m_.float(), a_[0].float(), a_[1].float(), EPS, s_.float()
+            x_.float(), m_.float(), a_[0].float(), a_[1].float(), EPS, s_.float(), use_rma
         )
 
     xv = x.float().requires_grad_(True)
     mv = m.float().requires_grad_(True)
     av = [ai.float().requires_grad_(True) for ai in a]
     sv = score.float().requires_grad_(True)
-    out = fused_polynorm_glu_impl(xv, mv, av[0], av[1], EPS, sv)
+    out = fused_polynorm_glu_impl(xv, mv, av[0], av[1], EPS, sv, use_rma)
     gout = torch.randn_like(out)
     out.backward(gout)
 
@@ -142,24 +149,26 @@ def test_fused_backward_finite_difference():
 
 
 @pytest.mark.internal
+@pytest.mark.parametrize("use_rma", [True, False], ids=["rma", "rms"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_module_dense_uses_fused(dtype):
+def test_module_dense_uses_fused(dtype, use_rma):
     """PolyNorm module (dense) on CUDA matches the reference and routes to the fused path."""
     M, D = 64, 256
     torch.manual_seed(2)
     x = torch.randn(M, D, dtype=dtype, device="cuda", requires_grad=True)
     m = torch.randn(M, D, dtype=dtype, device="cuda", requires_grad=True)
-    mod = PolyNorm(num_local_experts=1, config=None, alpha_init=0.2, eps=EPS).cuda().to(dtype)
+    mod = PolyNorm(num_local_experts=1, config=None, alpha_init=0.2, eps=EPS, use_rma=use_rma).cuda().to(dtype)
     out = mod(x, m)
-    ref = _ref(x.detach(), m.detach(), mod.alpha_1.detach().abs(), mod.alpha_2.detach().abs())
+    ref = _ref(x.detach(), m.detach(), mod.alpha_1.detach().abs(), mod.alpha_2.detach().abs(), use_rma=use_rma)
     assert torch.allclose(out, ref, **_tols(dtype)), (out - ref).abs().max()
     out.sum().backward()
     assert x.grad is not None and mod.alpha_1.grad is not None
 
 
 @pytest.mark.internal
+@pytest.mark.parametrize("use_rma", [True, False], ids=["rma", "rms"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_module_grouped_matches_reference(dtype):
+def test_module_grouped_matches_reference(dtype, use_rma):
     """PolyNorm module (grouped, per-expert coeffs + probs) matches the reference."""
     E = 3
     tpe = [5, 0, 11]  # include an empty expert
@@ -168,7 +177,7 @@ def test_module_grouped_matches_reference(dtype):
     x = torch.randn(Mt, D, dtype=dtype, device="cuda", requires_grad=True)
     m = torch.randn(Mt, D, dtype=dtype, device="cuda", requires_grad=True)
     probs = torch.rand(Mt, 1, device="cuda", requires_grad=True)
-    mod = PolyNorm(num_local_experts=E, config=None, alpha_init=0.2, eps=EPS).cuda().to(dtype)
+    mod = PolyNorm(num_local_experts=E, config=None, alpha_init=0.2, eps=EPS, use_rma=use_rma).cuda().to(dtype)
     with torch.no_grad():
         mod.alpha_1.copy_(torch.tensor([0.1, 0.3, 0.5], device="cuda").to(dtype))
         mod.alpha_2.copy_(torch.tensor([0.2, 0.4, 0.6], device="cuda").to(dtype))
@@ -177,7 +186,7 @@ def test_module_grouped_matches_reference(dtype):
     tpe_t = torch.tensor(tpe, device="cuda")
     a1 = torch.repeat_interleave(mod.alpha_1.detach().abs(), tpe_t)
     a2 = torch.repeat_interleave(mod.alpha_2.detach().abs(), tpe_t)
-    ref = _ref(x.detach(), m.detach(), a1, a2, score=probs.detach())
+    ref = _ref(x.detach(), m.detach(), a1, a2, score=probs.detach(), use_rma=use_rma)
     assert torch.allclose(out, ref, **_tols(dtype)), (out - ref).abs().max()
     out.sum().backward()
     assert mod.alpha_1.grad.shape == (E,)

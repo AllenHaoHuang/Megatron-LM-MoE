@@ -376,6 +376,24 @@ class OptimizerConfig:
     """Absolute LR for the per-axis gains AdamW. When unset, falls back to --lr (and still tracks
     the schedule shape of the main LR)."""
 
+    matrix_weight_decay: Optional[float] = None
+    """Weight decay for matrix (2D) params under md_decoupling. When unset, falls back to
+    --weight-decay. Set to 0.0 to disable decay on the directions/matrices while keeping it on the
+    gains via --gains-weight-decay. Note: with an active hypersphere mode the post-step L2
+    projection re-normalizes the matrix, so matrix weight decay is largely inert anyway."""
+
+    gains_weight_decay: Optional[float] = None
+    """Weight decay for the per-axis gains (scale terms) under md_decoupling. When unset, falls
+    back to --weight-decay. This is the meaningful magnitude regularizer when directions live on a
+    hypersphere. See gains_weight_decay_target for where it pulls the gain toward."""
+
+    gains_weight_decay_target: str = 'zero'
+    """Where the gains weight decay pulls the gain under md_decoupling. 'zero' (default): toward
+    raw gain 0 (effective multiplier toward phi(0) — 0 for 'direct', ln2 for 'softplus'). 'neutral':
+    toward effective multiplier 1, i.e. no scaling impact (the Qwen-style "decay to 1"). 'init':
+    toward each gain's seeded init value (same as 'neutral' unless --hypersphere-preserve-init had
+    the gain absorb the init magnitude)."""
+
     gain_parametrization: str = 'softplus'
     """Reparametrize the stored gain g; effective multiplier is phi(g). 'direct' keeps phi(g)=g;
     'softplus' uses phi(g)=softplus(g) (always positive). Applied uniformly to row/col/flat."""

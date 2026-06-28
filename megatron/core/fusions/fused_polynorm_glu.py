@@ -4,11 +4,24 @@
 For a token row ``x`` (the GLU gate half) and ``m`` (the GLU linear half ``x_linear``) this computes,
 in a single pass over the ffn feature dimension ``D``::
 
-    norm(z)_i = z_i * rsqrt( mean_j(z_j**2) + eps )          # reduce over the feature dim, fp32
+    norm(z)_i = z_i * rsqrt( mean_j(g(z_j)) + eps )          # reduce over the feature dim, fp32
     gate_i    = a1 * norm(x)_i + a2 * norm(x**2)_i
     out_i     = gate_i * m_i * score                         # score optional (per token)
 
-It fuses the gate (a feature-wise RMS-style reduction), the GLU multiply by ``x_linear`` and the
+The reduced statistic ``g`` selects the normalizer via the ``USE_RMA`` constexpr (the owning module
+sets it from ``config.pnglu_norm``):
+
+* ``RMA`` (root-mean-abs, ``g = |z|``): ``norm(z) = z / sqrt(mean|z|)`` — degree-1/2 in z.
+* ``RMS`` (root-mean-square, ``g = z**2``): ``norm(z) = z / sqrt(mean z**2)`` — degree-0 (the
+  classic scale-invariant RMSNorm).
+
+RMA is the default because the degree-1/2 norm makes the gate *not* exactly scale-invariant in its
+input, so the upstream fc1 weight stays anchored by the loss (see
+:func:`megatron.core.activations.compiled_polynorm`). RMS is kept for A/B comparison. Note that for
+the ``norm(x**2)`` term ``|x**2| == x**2``, so under RMA it divides by ``sqrt(mean x**2)`` (= RMS(x))
+and under RMS by ``sqrt(mean x**4)``.
+
+It fuses the gate (a feature-wise reduction), the GLU multiply by ``x_linear`` and the
 optional per-token ``score`` (MoE router probs / per-token scale) multiply into one kernel, mirroring
 the SwiGLU fusion in ``fused_bias_swiglu.py`` so PolyNorm GLU runs close to SwiGLU throughput. The
 grid is over token rows, so the kernel is shape-agnostic in the token count (no torch.compile-style
@@ -65,7 +78,7 @@ def _num_warps_for(block_size: int) -> int:
 @triton.jit
 def _polynorm_glu_fwd_kernel(
     out_ptr,  # (M, D) output
-    inv_ptr,  # (M, 2) fp32, saved inverse-RMS per order for backward
+    inv_ptr,  # (M, 2) fp32, saved inverse-norm scales (inv1,inv2) per order for backward
     x_ptr,  # (M, D) gate half (x_glu)
     m_ptr,  # (M, D) linear half (x_linear)
     a1_ptr,  # (M,) fp32 per-token coefficient for norm(x)
@@ -80,6 +93,7 @@ def _polynorm_glu_fwd_kernel(
     D,
     rD,  # 1.0 / D, precomputed in fp32
     eps,
+    USE_RMA: tl.constexpr,  # True: sqrt(mean|.|) norm; False: RMS (sqrt(mean .**2)) norm
     HAS_SCORE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -92,9 +106,15 @@ def _polynorm_glu_fwd_kernel(
 
     x2 = x * x
 
-    # S_k = sum_j (x_j**k)**2 ; masked elements are 0 so they don't contribute.
-    s1 = tl.sum(x2, axis=0)
-    s2 = tl.sum(x2 * x2, axis=0)
+    # Reductions for the two normalizers. Masked elements are 0 so they don't contribute.
+    # RMA  (sqrt(mean|.|)):   s1 = sum|x|  -> norm(x)/sqrt(mean|x|),  s2 = sum x^2 -> norm(x^2)/sqrt(mean x^2)
+    # RMS  (sqrt(mean .^2)):  s1 = sum x^2 -> norm(x)/sqrt(mean x^2), s2 = sum x^4 -> norm(x^2)/sqrt(mean x^4)
+    if USE_RMA:
+        s1 = tl.sum(tl.abs(x), axis=0)
+        s2 = tl.sum(x2, axis=0)
+    else:
+        s1 = tl.sum(x2, axis=0)
+        s2 = tl.sum(x2 * x2, axis=0)
     inv1 = tl.rsqrt(s1 * rD + eps)
     inv2 = tl.rsqrt(s2 * rD + eps)
 
@@ -121,7 +141,7 @@ def _polynorm_glu_bwd_kernel(
     dout_ptr,  # (M, D) incoming grad
     x_ptr,  # (M, D) gate half (saved)
     m_ptr,  # (M, D) linear half (saved)
-    inv_ptr,  # (M, 2) fp32 saved inverse-RMS
+    inv_ptr,  # (M, 2) fp32 saved inverse-norm scales
     a1_ptr,
     a2_ptr,
     score_ptr,
@@ -137,6 +157,7 @@ def _polynorm_glu_bwd_kernel(
     stride_dm_col,
     D,
     rD,
+    USE_RMA: tl.constexpr,  # must match the forward: True=sqrt(mean|.|), False=RMS
     HAS_SCORE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -156,7 +177,6 @@ def _polynorm_glu_bwd_kernel(
     a2 = tl.load(a2_ptr + row)
 
     x2 = x * x
-    x3 = x2 * x  # used by the k=2 coupling term below
 
     gate = a1 * x * inv1 + a2 * x2 * inv2
 
@@ -174,13 +194,24 @@ def _polynorm_glu_bwd_kernel(
     A1 = tl.sum(dgate * x, axis=0)
     A2 = tl.sum(dgate * x2, axis=0)
 
-    # dX_j = dgate_j * (a1*inv1 + 2*a2*inv2*x_j)
-    #        - (1/D) * ( a1*inv1**3*x_j*A1 + 2*a2*inv2**3*x_j**3*A2 )
+    # Direct (i=j) term is identical for both norms:
+    #   dX_j += dgate_j * (a1*inv1 + 2*a2*inv2*x_j)
+    # Coupling (through inv1,inv2 which depend on all features) differs by normalizer, because the
+    # per-feature derivative of the reduced statistic differs:
+    #   RMA: d(mean|x|)/dx_j = rD*sign(x_j),  d(mean x^2)/dx_j = rD*2x_j
+    #        -> coupling = 1/2*a1*inv1^3*sign(x_j)*A1 + a2*inv2^3*x_j*A2
+    #   RMS: d(mean x^2)/dx_j = rD*2x_j,      d(mean x^4)/dx_j = rD*4x_j^3
+    #        -> coupling =     a1*inv1^3*x_j*A1   + 2*a2*inv2^3*x_j^3*A2
+    #   dX_j += -(1/D) * coupling
     direct = a1 * inv1 + 2.0 * a2 * inv2 * x
-    coupling = (
-        a1 * inv1 * inv1 * inv1 * x * A1
-        + 2.0 * a2 * inv2 * inv2 * inv2 * x3 * A2
-    )
+    inv1_3 = inv1 * inv1 * inv1
+    inv2_3 = inv2 * inv2 * inv2
+    if USE_RMA:
+        sign_x = tl.where(x > 0, 1.0, tl.where(x < 0, -1.0, 0.0))
+        coupling = 0.5 * a1 * inv1_3 * sign_x * A1 + a2 * inv2_3 * x * A2
+    else:
+        x3 = x2 * x
+        coupling = a1 * inv1_3 * x * A1 + 2.0 * a2 * inv2_3 * x3 * A2
     dx = dgate * direct - rD * coupling
     tl.store(dx_ptr + row * stride_dx_row + cols * stride_dx_col, dx, mask=mask)
 
@@ -202,7 +233,7 @@ class FusedPolyNormGLUFunction(torch.autograd.Function):
 
     @classmethod
     def call_forward(
-        cls, x_glu, x_linear, a1, a2, eps, score
+        cls, x_glu, x_linear, a1, a2, eps, score, use_rma=True
     ):
         M, D = x_glu.shape
         out = torch.empty((M, D), dtype=x_glu.dtype, device=x_glu.device)
@@ -228,6 +259,7 @@ class FusedPolyNormGLUFunction(torch.autograd.Function):
             D,
             1.0 / D,
             eps,
+            USE_RMA=use_rma,
             HAS_SCORE=has_score,
             BLOCK_SIZE=block,
             num_warps=_num_warps_for(block),
@@ -235,7 +267,7 @@ class FusedPolyNormGLUFunction(torch.autograd.Function):
         return out, inv
 
     @staticmethod
-    def forward(ctx, x_glu, x_linear, a1, a2, eps, score):
+    def forward(ctx, x_glu, x_linear, a1, a2, eps, score, use_rma=True):
         M, D = x_glu.shape
         out = torch.empty((M, D), dtype=x_glu.dtype, device=x_glu.device)
         inv = torch.empty((M, 2), dtype=torch.float32, device=x_glu.device)
@@ -260,6 +292,7 @@ class FusedPolyNormGLUFunction(torch.autograd.Function):
             D,
             1.0 / D,
             eps,
+            USE_RMA=use_rma,
             HAS_SCORE=has_score,
             BLOCK_SIZE=block,
             num_warps=_num_warps_for(block),
@@ -271,13 +304,15 @@ class FusedPolyNormGLUFunction(torch.autograd.Function):
         ctx.save_for_backward(*saved)
         ctx.has_score = has_score
         ctx.eps = eps
+        ctx.use_rma = use_rma
         return out
-    
+
     @classmethod
     def call_backward(
-        cls, 
-        grad_output, 
-        saved
+        cls,
+        grad_output,
+        saved,
+        use_rma=True,
     ):
         x_glu, x_linear, a1, a2, inv = saved[:5]
         score = saved[5] if len(saved) > 5 else None
@@ -322,6 +357,7 @@ class FusedPolyNormGLUFunction(torch.autograd.Function):
             dm.stride(1),
             D,
             1.0 / D,
+            USE_RMA=use_rma,
             HAS_SCORE=has_score,
             BLOCK_SIZE=block,
             num_warps=_num_warps_for(block),
@@ -377,13 +413,14 @@ class FusedPolyNormGLUFunction(torch.autograd.Function):
             dm.stride(1),
             D,
             1.0 / D,
+            USE_RMA=ctx.use_rma,
             HAS_SCORE=has_score,
             BLOCK_SIZE=block,
             num_warps=_num_warps_for(block),
         )
 
-        # eps (position 4) gets no gradient; score grad is None when score was None.
-        return dx, dm, da1, da2, None, (dscore if has_score else None)
+        # eps (pos 4) and use_rma (pos 6) get no gradient; score grad is None when score was None.
+        return dx, dm, da1, da2, None, (dscore if has_score else None), None
 
 
 def fused_polynorm_glu_impl(
@@ -393,6 +430,7 @@ def fused_polynorm_glu_impl(
     a2: torch.Tensor,
     eps: float,
     score: Optional[torch.Tensor] = None,
+    use_rma: bool = True,
 ) -> torch.Tensor:
     """Fused 2nd-order PolyNorm GLU: ``gate(x_glu) * x_linear * [score]``.
 
@@ -401,8 +439,9 @@ def fused_polynorm_glu_impl(
         a1, a2: positive per-token coefficients, broadcastable to ``(M,)`` where ``M`` is the
             number of tokens (``prod(x_glu.shape[:-1])``). The owning module passes either a single
             shared coefficient or one per token (grouped experts).
-        eps: RMS epsilon.
+        eps: normalization epsilon (added under the sqrt of the mean-abs / mean-square denom).
         score: optional per-token multiplier ``(..., 1)`` / ``(...)`` (MoE router probs / scale).
+        use_rma: True (default) -> RMA (sqrt(mean|.|)) norm; False -> RMS (sqrt(mean .**2)) norm.
 
     Returns:
         Tensor of ``x_glu``'s shape and dtype.
@@ -425,7 +464,7 @@ def fused_polynorm_glu_impl(
     if score is not None:
         score2 = score.reshape(-1)
 
-    out = FusedPolyNormGLUFunction.apply(x2, m2, a1, a2, eps, score2)
+    out = FusedPolyNormGLUFunction.apply(x2, m2, a1, a2, eps, score2, use_rma)
     return out.reshape(ori_shape)
 
 
@@ -462,13 +501,17 @@ def fused_polynorm_glu_forward(
     a2: torch.Tensor,
     eps: float,
     score: Optional[torch.Tensor] = None,
+    use_rma: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """2nd-order PolyNorm GLU forward.
+
+    ``use_rma`` selects the normalizer (True=RMA sqrt(mean|.|), False=RMS); it must be passed
+    unchanged to :func:`fused_polynorm_glu_backward`.
     """
     x_glu, x_linear, lead_shape, d = _split_glu_halves(fc1_output)
     a1, a2 = _per_token_coeffs(a1, a2, x_glu.shape[0])
     score2 = score.reshape(-1) if score is not None else None
-    out, inv = FusedPolyNormGLUFunction.call_forward(x_glu, x_linear, a1, a2, eps, score2)
+    out, inv = FusedPolyNormGLUFunction.call_forward(x_glu, x_linear, a1, a2, eps, score2, use_rma)
     return out.reshape(lead_shape + (d,)), inv
 
 
@@ -480,10 +523,12 @@ def fused_polynorm_glu_backward(
     inv: torch.Tensor,
     eps: float,
     score: Optional[torch.Tensor] = None,
+    use_rma: bool = True,
 ):
     """2nd-order PolyNorm GLU backward.
 
-    Recomputes the inverse-RMS state from fc1_output then runs the fused backward kernel.
+    Recomputes the inverse-norm state from fc1_output then runs the fused backward kernel.
+    ``use_rma`` must match the value passed to :func:`fused_polynorm_glu_forward`.
     """
     x_glu, x_linear, lead_shape, d = _split_glu_halves(fc1_output)
     # A single shared coefficient receives the summed per-token gradient (mirrors the
@@ -492,7 +537,7 @@ def fused_polynorm_glu_backward(
     a1_c, a2_c = _per_token_coeffs(a1, a2, x_glu.shape[0])
     score2 = score.reshape(-1) if score is not None else None
 
-    # Recompute inverse-RMS.
+    # Recompute inverse-norm scales.
     # _, to_save = FusedPolyNormGLUFunction.call_forward(x_glu, x_linear, a1_c, a2_c, eps, None)
     # inv = to_save[4]
     
@@ -503,7 +548,7 @@ def fused_polynorm_glu_backward(
         saved.append(score2)
 
     grad_flat = grad_output.reshape(-1, d)
-    dx, dm, da1, da2, _, dscore = FusedPolyNormGLUFunction.call_backward(grad_flat, saved)
+    dx, dm, da1, da2, _, dscore = FusedPolyNormGLUFunction.call_backward(grad_flat, saved, use_rma)
     grad_fc1 = torch.cat([dx, dm], dim=-1).reshape(lead_shape + (2 * d,))
     if shared_coeff:
         da1 = da1.sum(0, keepdim=True).reshape(a1.shape)

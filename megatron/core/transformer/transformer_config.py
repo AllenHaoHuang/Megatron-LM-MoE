@@ -203,14 +203,23 @@ class TransformerConfig(ModelParallelConfig):
     pnglu: bool = False
     """If True, replace the gate of the gated linear unit (e.g. SiLU in SwiGLU) with a learnable
     2nd-order PolyNorm GLU: ``PolyNorm(x_glu) * x_linear`` where
-    ``PolyNorm(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2)``. Requires
+    ``PolyNorm(x) = |a1|*norm(x) + |a2|*norm(x**2)`` and ``norm`` is selected by ``pnglu_norm``
+    (default RMA: ``norm(x)=x/sqrt(mean|x|)``, ``norm(x**2)=x**2/sqrt(mean(x**2))``). Requires
     ``gated_linear_unit=True``. Each (local) expert in an MoE layer gets its own ``(a1, a2)``
-    coefficients. The RMSNorm reduces over the ffn feature dimension and is made TP/ETP-invariant
-    by all-reducing the feature statistics and the alpha gradients across the relevant
+    coefficients. The normalization reduces over the ffn feature dimension and is made TP/ETP-
+    invariant by all-reducing the feature statistics and the alpha gradients across the relevant
     tensor-parallel group, so any TP/ETP degree is supported. Not compatible with
     ``bias_activation_fusion``, ``use_te_activation_func``, fp8/fp4, the offloading-experts path,
     or ``transformer_impl='inference_optimized'`` (these assume the built-in fused SwiGLU/SiLU
     kernels)."""
+
+    pnglu_norm: Literal['rma', 'rms'] = 'rma'
+    """Normalizer inside PolyNorm GLU (``pnglu=True``). 'rma' (root-mean-abs, default):
+    ``norm(t)=t/sqrt(mean|t|)`` — degree-1/2, so the gate is NOT scale-invariant in its input and
+    the upstream fc1 weight stays anchored by the loss (recommended). 'rms' (root-mean-square):
+    ``norm(t)=t/sqrt(mean t**2)`` — the classic RMSNorm gate, exactly scale-invariant in its input
+    (leaves fc1 as a loss-unconstrained "free" direction with effective LR ~ 1/||W||^2); kept for
+    A/B comparison. Applies consistently across the fused, torch and TP-sharded paths."""
 
     pnglu_fusion: bool = True
     """If True (default), use the fused Triton kernel for PolyNorm GLU (``pnglu=True``) — it fuses

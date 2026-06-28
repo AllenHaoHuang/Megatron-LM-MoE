@@ -63,6 +63,7 @@ class OffloadingFP8Config:
     gated_linear_unit: bool
     gated_polynorm_linear_unit: bool
     polynorm_eps: float = 1e-6
+    polynorm_use_rma: bool = True  # True: RMA (sqrt(mean|.|)) gate norm; False: RMS
     fc1_out_size: int = 0
 
     # offloading
@@ -103,6 +104,7 @@ class OffloadingFP8Config:
             gated_linear_unit=config.gated_linear_unit,
             gated_polynorm_linear_unit=config.pnglu,
             polynorm_eps=getattr(config, "polynorm_eps", 1e-6),
+            polynorm_use_rma=(getattr(config, "pnglu_norm", "rma") == "rma"),
             moe_offloading_chunk_size=config.moe_offloading_chunk_size,
             moe_offloading_num_chunks=config.moe_offloading_num_chunks,
             moe_offloading_num_stages=config.moe_offloading_num_stages,
@@ -624,6 +626,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 a2,
                 config.polynorm_eps,
                 permuted_probs.unsqueeze(-1),
+                config.polynorm_use_rma,
             )
         else:
             s = swiglu_forward(
@@ -745,7 +748,8 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         
         if config.gated_polynorm_linear_unit:
             grad_a, grad_a1, grad_a2, grad_probs = fused_polynorm_glu_backward(
-                grad_s, a, a1, a2, inv, config.polynorm_eps, permuted_probs.unsqueeze(-1)
+                grad_s, a, a1, a2, inv, config.polynorm_eps, permuted_probs.unsqueeze(-1),
+                config.polynorm_use_rma,
             )
             return grad_a, grad_probs, grad_a1, grad_a2
         else:
@@ -852,7 +856,8 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         """
         if config.gated_polynorm_linear_unit:
             s, _ = fused_polynorm_glu_forward(
-                a, a1, a2, config.polynorm_eps, permuted_probs.unsqueeze(-1)
+                a, a1, a2, config.polynorm_eps, permuted_probs.unsqueeze(-1),
+                config.polynorm_use_rma,
             )
         else:
             s = swiglu_forward(a, permuted_probs.unsqueeze(-1))

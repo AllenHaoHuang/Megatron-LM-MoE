@@ -13,12 +13,29 @@ from megatron.core.transformer.module import MegatronModule
 
 
 @jit_fuser
-def compiled_polynorm(x, alpha_1, alpha_2, eps: float = 1e-6):
-    """Core PolyNorm GLU gate: ``a1*RMSNorm(x) + a2*RMSNorm(x**2)``.
+def compiled_polynorm(x, alpha_1, alpha_2, eps: float = 1e-6, use_rma: bool = True):
+    """Core PolyNorm GLU gate: ``a1*norm(x) + a2*norm(x**2)``.
 
-    The RMS normalization is taken over the last (feature) dimension. The math is done in
-    fp32 for numerical stability and cast back to the input dtype, mirroring how the
-    RMSNorm/LayerNorm layers in this codebase behave under mixed precision.
+    ``norm(t) = t / sqrt(mean_j(g(t_j)) + eps)`` reduces over the last (feature) dimension. The
+    statistic ``g`` is selected by ``use_rma``:
+
+    * ``use_rma=True`` (default) — **RMA**, ``g=|t|`` (root-mean-abs)::
+
+          norm(x)    = x    / sqrt(mean|x|)       # degree-1/2 in x
+          norm(x**2) = x**2 / sqrt(mean(x**2))    # degree-1   in x  (since |x**2| == x**2)
+
+    * ``use_rma=False`` — **RMS**, ``g=t**2`` (the classic scale-invariant RMSNorm)::
+
+          norm(x)    = x    / sqrt(mean(x**2))    # degree-0 in x
+          norm(x**2) = x**2 / sqrt(mean(x**4))
+
+    RMA is the default because the degree-1/2 norm is *not* exactly scale-invariant in the input,
+    so the upstream fc1 weight is not left as an unconstrained ("free") direction the loss cannot
+    anchor — the RMS (degree-0) gate is scale-invariant and leaves fc1 with effective LR ~
+    1/||W||^2 and no restoring force, a training-stability hazard. RMS is retained for A/B.
+
+    The math is done in fp32 and cast back to the input dtype, mirroring the
+    RMSNorm/LayerNorm layers in this codebase under mixed precision.
 
     ``alpha_1``/``alpha_2`` broadcast against ``x``. They are either a single
     (broadcastable) coefficient of shape ``(1,)`` (dense / single-expert case) or per-token
@@ -33,7 +50,10 @@ def compiled_polynorm(x, alpha_1, alpha_2, eps: float = 1e-6):
     x = x.float()
 
     def norm(t):
-        return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps)
+        # RMA: g=|t| (for the x**2 term |x**2|==x**2, i.e. divides by sqrt(mean x**2)=RMS(x)).
+        # RMS: g=t**2.
+        stat = t.abs() if use_rma else t * t
+        return t * torch.rsqrt(stat.mean(-1, keepdim=True) + eps)
 
     out = alpha_1 * norm(x) + alpha_2 * norm(x * x)
     return out.to(input_dtype)
@@ -93,9 +113,12 @@ class PolyNorm(MegatronModule):
     ``gate(x_glu) * x_linear``. Standard SwiGLU uses ``gate = SiLU``. Here the gate is the
     (2nd-order) PolyNorm::
 
-        gate(x) = |alpha_1| * RMSNorm(x) + |alpha_2| * RMSNorm(x ** 2)
+        gate(x) = |alpha_1| * x / sqrt(mean|x|) + |alpha_2| * x**2 / sqrt(mean(x**2))
 
-    where ``alpha_1``/``alpha_2`` are learnable (``abs`` keeps them positive).
+    i.e. ``a1*norm(x) + a2*norm(x**2)`` with the ``sqrt(mean|.|)`` normalizer (see
+    :func:`compiled_polynorm` for why this degree-1/2 norm is used instead of RMS: it avoids
+    making the upstream fc1 weight a loss-unconstrained "free" direction). ``alpha_1``/``alpha_2``
+    are learnable (``abs`` keeps them positive).
 
     ``forward`` takes *both* GLU halves and returns the full ``gate(x_glu) * x_linear * [score]``
     product. On CUDA (and ``tp_size == 1``) the gate, the GLU multiply and the optional per-token
@@ -113,12 +136,13 @@ class PolyNorm(MegatronModule):
     coefficients of the expert it was routed to. For a dense MLP (or a ``SequentialMLP``
     expert) ``num_local_experts == 1`` and the single coefficient is broadcast to all tokens.
 
-    Tensor parallelism: the RMSNorm reduces over the ffn feature dimension, which is sharded
-    across ``tp_group`` (the main TP group for dense/shared MLPs, the expert-TP group for MoE
-    experts). When ``tp_group`` has size > 1, the per-token sum-of-squares is all-reduced over
-    the group (forward and backward) so every rank uses the *full-feature* RMS, and the
-    replicated ``alpha`` gradients are all-reduced over the group so the replicas stay in sync.
-    The result is therefore identical to (and bitwise-consistent across) any TP/ETP degree.
+    Tensor parallelism: the gate's normalization reduces over the ffn feature dimension, which is
+    sharded across ``tp_group`` (the main TP group for dense/shared MLPs, the expert-TP group for
+    MoE experts). When ``tp_group`` has size > 1, the per-token partial feature sums (sum|x| and
+    sum(x**2)) are all-reduced over the group (forward and backward) so every rank uses the
+    *full-feature* statistics, and the replicated ``alpha`` gradients are all-reduced over the
+    group so the replicas stay in sync. The result is therefore identical to (and bitwise-
+    consistent across) any TP/ETP degree.
     """
 
     def __init__(
@@ -128,12 +152,18 @@ class PolyNorm(MegatronModule):
         alpha_init: float = 0.2,
         eps: float = 1e-6,
         tp_group: "torch.distributed.ProcessGroup | None" = None,
+        use_rma: "bool | None" = None,
     ):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.alpha_1 = nn.Parameter(torch.full((num_local_experts,), alpha_init))
         self.alpha_2 = nn.Parameter(torch.full((num_local_experts,), alpha_init))
         self.eps = eps
+        # Normalizer choice: RMA (sqrt(mean|.|), default) vs RMS (sqrt(mean .**2)). Explicit
+        # ``use_rma`` wins; otherwise read ``config.pnglu_norm`` ('rma'/'rms'), defaulting to RMA.
+        if use_rma is None:
+            use_rma = getattr(config, "pnglu_norm", "rma") == "rma"
+        self.use_rma = use_rma
         # The group over which the ffn feature dimension is sharded. tp_size==1 (no sharding,
         # e.g. local CPU runs or ETP=1 experts) takes the cheap fused path with no collectives.
         self.tp_group = tp_group
@@ -181,14 +211,14 @@ class PolyNorm(MegatronModule):
         )
         if use_fused:
             # Single fused kernel: gate + (* x_linear) + (* scores), shape-agnostic over tokens.
-            return fused_polynorm_glu_impl(x_glu, x_linear, a1, a2, self.eps, scores)
+            return fused_polynorm_glu_impl(x_glu, x_linear, a1, a2, self.eps, scores, self.use_rma)
 
         # Fallback: compute the gate in torch, then apply the multiplies in eager mode.
         a1b = a1.unsqueeze(-1) if a1.dim() == 1 and self.num_local_experts > 1 else a1
         a2b = a2.unsqueeze(-1) if a2.dim() == 1 and self.num_local_experts > 1 else a2
         if self.tp_size == 1:
             # ffn feature dim is whole on this rank: cheap fused per-token norm.
-            gate = compiled_polynorm(x_glu, a1b, a2b, self.eps)
+            gate = compiled_polynorm(x_glu, a1b, a2b, self.eps, self.use_rma)
         else:
             # ffn feature dim is TP-sharded: reduce the feature statistics across the group.
             gate = self._tp_forward(x_glu, a1b, a2b)
@@ -199,15 +229,24 @@ class PolyNorm(MegatronModule):
         return out
 
     def _tp_forward(self, x, alpha_1, alpha_2):
-        """TP-invariant path: recover the full-feature RMS from the local feature shards."""
+        """TP-invariant path: recover the full-feature norm statistics from the local shards.
+
+        Honours :attr:`use_rma` (see :func:`compiled_polynorm`):
+        RMA -> norm(x)/sqrt(mean|x|), norm(x**2)/sqrt(mean x**2);
+        RMS -> norm(x)/sqrt(mean x**2), norm(x**2)/sqrt(mean x**4).
+        """
         input_dtype = x.dtype
         xf = x.float()
         # Each ColumnParallel rank holds an equal 1/tp_size slice of the ffn features.
         n_global = xf.shape[-1] * self.tp_size
-        # Per-token partial feature sums on this rank: sum(x^2) and sum(x^4) (== sum((x^2)^2)) for
-        # RMSNorm(x) and RMSNorm(x^2). One symmetric all-reduce completes both.
-        s1 = xf.pow(2).sum(-1, keepdim=True)
-        s2 = xf.pow(2).pow(2).sum(-1, keepdim=True)
+        # Per-token partial feature sums on this rank for the two norm denominators (s1 for norm(x),
+        # s2 for norm(x**2)). One symmetric all-reduce completes both into full-feature sums.
+        if self.use_rma:
+            s1 = xf.abs().sum(-1, keepdim=True)        # mean|x|
+            s2 = xf.pow(2).sum(-1, keepdim=True)       # mean x^2  (|x^2|==x^2)
+        else:
+            s1 = xf.pow(2).sum(-1, keepdim=True)       # mean x^2
+            s2 = xf.pow(2).pow(2).sum(-1, keepdim=True)  # mean x^4
         s = _AllReduceSumSymmetric.apply(torch.cat([s1, s2], dim=-1), self.tp_group)
         inv1 = torch.rsqrt(s[..., 0:1] / n_global + self.eps)
         inv2 = torch.rsqrt(s[..., 1:2] / n_global + self.eps)

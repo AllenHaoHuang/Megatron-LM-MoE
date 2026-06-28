@@ -455,6 +455,12 @@ class MDDecoupling(_MDDecouplingBase):
         gains_betas: tuple[float, float] = (0.9, 0.999),
         gains_eps: float = 1e-8,
         gains_weight_decay: float = 0.0,
+        # Where the gains weight decay pulls the raw gain `g` toward (decoupled, AdamW-style):
+        #   "zero"    → g toward 0           → multiplier toward phi(0)  (0 for direct, ln2 softplus)
+        #   "neutral" → g toward phi^-1(1)   → multiplier toward 1       (no scaling impact)
+        #   "init"    → g toward its seeded init value (== neutral unless preserve_init absorbs
+        #               the init magnitude into the gain).
+        gains_weight_decay_target: Literal["zero", "neutral", "init"] = "zero",
         # Reparametrize the per-axis gain: the stored state tensor is `g`, the effective
         # multiplier applied to `p` is `phi(g)`. "direct" is the identity (phi(g)=g);
         # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
@@ -469,6 +475,7 @@ class MDDecoupling(_MDDecouplingBase):
         self.gains_betas = gains_betas
         self.gains_eps = gains_eps
         self.gains_weight_decay = gains_weight_decay
+        self.gains_weight_decay_target = gains_weight_decay_target
         self.gain_parametrization = gain_parametrization
         super().__init__(params, **kwargs)
         # Gain state is initialized lazily at first step (see step() → _maybe_init_gain_state).
@@ -529,6 +536,20 @@ class MDDecoupling(_MDDecouplingBase):
             norm = torch.sqrt(norm_squared)
         return norm.to(torch.float32).clamp_min(self.hypersphere_eps)
 
+    def _gain_wd_target(self, init_gain: torch.Tensor) -> torch.Tensor:
+        """Raw-gain value the weight decay pulls toward (see gains_weight_decay_target). Returned
+        as a 0-dim scalar for "zero"/"neutral" (broadcasts over the gain axis) and as a per-axis
+        clone of the seeded init for "init"."""
+        mode = self.gains_weight_decay_target
+        if mode == "init":
+            return init_gain.detach().clone()
+        if mode == "neutral":
+            # phi^-1(1): the raw gain whose effective multiplier is exactly 1 (no scaling impact).
+            return self._phi_inv(torch.ones((), dtype=init_gain.dtype, device=init_gain.device))
+        if mode == "zero":
+            return torch.zeros((), dtype=init_gain.dtype, device=init_gain.device)
+        raise ValueError(f"Unknown gains_weight_decay_target {mode}")
+
     def _maybe_init_gain_state(self, p):
         if self.hypersphere_gains_mode is None or p.ndim < 2:
             return
@@ -577,6 +598,7 @@ class MDDecoupling(_MDDecouplingBase):
             state["row_gain"] = self._phi_inv(target)
             state["row_gain_m"] = torch.zeros_like(state["row_gain"])
             state["row_gain_v"] = torch.zeros_like(state["row_gain"])
+            state["row_gain_wd_target"] = self._gain_wd_target(state["row_gain"])
 
         if wants_col:
             if absorb_axis == "col":
@@ -589,6 +611,7 @@ class MDDecoupling(_MDDecouplingBase):
             state["col_gain"] = self._phi_inv(target)
             state["col_gain_m"] = torch.zeros_like(state["col_gain"])
             state["col_gain_v"] = torch.zeros_like(state["col_gain"])
+            state["col_gain_wd_target"] = self._gain_wd_target(state["col_gain"])
 
         if wants_flat:
             if absorb_axis == "flat":
@@ -608,6 +631,7 @@ class MDDecoupling(_MDDecouplingBase):
             state["flat_gain"] = self._phi_inv(target)
             state["flat_gain_m"] = torch.zeros_like(state["flat_gain"])
             state["flat_gain_v"] = torch.zeros_like(state["flat_gain"])
+            state["flat_gain_wd_target"] = self._gain_wd_target(state["flat_gain"])
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -750,8 +774,14 @@ class MDDecoupling(_MDDecouplingBase):
             gain = state[name]
             m = state[f"{name}_m"]
             v = state[f"{name}_v"]
+            # Decay target. Lazily backfill for checkpoints saved before _wd_target existed (for
+            # "init" the original seed is gone, so fall back to the current value as the target).
+            target = state.get(f"{name}_wd_target")
+            if target is None:
+                target = self._gain_wd_target(gain)
+                state[f"{name}_wd_target"] = target
             _fused_gain_adam(
-                gain, m, v, grad,
+                gain, m, v, grad, target,
                 self._gain_lr_buf, self._gain_bc1_buf, self._gain_bc2_buf,
                 beta1, beta2, eps, wd,
             )
@@ -780,20 +810,22 @@ class MDDecoupling(_MDDecouplingBase):
 
 
 @torch.compile(dynamic=True)
-def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd):
+def _fused_gain_adam(gain, m, v, grad, target, lr, bc1, bc2, beta1, beta2, eps, wd):
     """Fused in-place Adam update for one gain tensor (compiled leaf kernel).
 
     lr / bc1 / bc2 are 0-dim tensors (they change every step, so passing them as
     tensors instead of Python floats avoids per-step recompilation); beta1, beta2,
-    eps and wd are run constants. `dynamic=True` shares one graph across the
-    differently shaped gain tensors. Equivalent to the eager update:
-        if wd: gain *= 1 - lr*wd
+    eps and wd are run constants. `target` is the (broadcastable) value the decoupled
+    weight decay pulls the gain toward — a 0-dim 0 reproduces standard decay-to-zero.
+    `dynamic=True` shares one graph across the differently shaped gain tensors.
+    Equivalent to the eager update:
+        if wd: gain -= lr*wd * (gain - target)
         m  = beta1*m + (1-beta1)*grad
         v  = beta2*v + (1-beta2)*grad^2
         gain -= (lr/bc1) * m / (v.sqrt()/bc2.sqrt() + eps)
     """
     if wd != 0.0:
-        gain.mul_(1.0 - lr * wd)
+        gain.sub_((gain - target).mul_(lr * wd))
     m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
     v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
     denom = (v.sqrt() / bc2.sqrt()).add_(eps)
@@ -1019,7 +1051,8 @@ def get_megatron_mddecoupling_optimizer(
     md_kwargs = dict(
         lr=(config.matrix_lr if config.matrix_lr is not None
             else config.muon_lr_factor * (config.lr or 0.0)),
-        weight_decay=config.weight_decay,
+        weight_decay=(config.matrix_weight_decay if config.matrix_weight_decay is not None
+                      else config.weight_decay),
         betas=(config.adam_beta1, config.adam_beta2),
         eps=config.adam_eps,
         hypersphere_mode=config.hypersphere_mode,
@@ -1054,7 +1087,9 @@ def get_megatron_mddecoupling_optimizer(
         ),
         gains_betas=(config.adam_beta1, config.adam_beta2),
         gains_eps=config.adam_eps,
-        gains_weight_decay=config.weight_decay,
+        gains_weight_decay=(config.gains_weight_decay if config.gains_weight_decay is not None
+                            else config.weight_decay),
+        gains_weight_decay_target=config.gains_weight_decay_target,
         gain_parametrization=config.gain_parametrization,
     )
 
